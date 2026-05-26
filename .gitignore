@@ -1,0 +1,16 @@
+# Thư mục ảo Python (virtual environment)
+venv/
+
+# Biến môi trường (API keys, Firebase key, mật khẩu, v.v.)
+.env
+firebase-key.json
+
+# File tạm do Python sinh ra
+__pycache__/
+*.pyc
+
+# File DB SQLite (nếu có)
+*.sqlite3
+
+# File rác hệ thống MacOS
+.DS_Store
