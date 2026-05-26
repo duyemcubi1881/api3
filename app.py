@@ -100,7 +100,7 @@ CLIENT_HMAC_SECRET = os.getenv("CLIENT_HMAC_SECRET")
 # Key Format: ShopBoutique - XXXXXXXX
 # =========================================================
 
-KEY_PREFIX = "ShopBoutiqueLegit"
+KEY_PREFIX = "RegeditV1Lock"
 KEY_SUFFIX_LENGTH = 8
 KEY_CHARS = string.ascii_uppercase + string.digits
 
