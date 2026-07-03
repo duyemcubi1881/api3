@@ -6,10 +6,10 @@ import string
 import json
 import time
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, redirect
 from flask_cors import CORS
 from werkzeug.security import check_password_hash, generate_password_hash
 
@@ -100,7 +100,7 @@ CLIENT_HMAC_SECRET = os.getenv("CLIENT_HMAC_SECRET")
 # Key Format: ShopBoutique - XXXXXXXX
 # =========================================================
 
-KEY_PREFIX = "Imgui1.3"
+KEY_PREFIX = "ImguiFree"
 KEY_SUFFIX_LENGTH = 8
 KEY_CHARS = string.ascii_uppercase + string.digits
 
@@ -230,8 +230,12 @@ def _duration_label(key_data: dict) -> str:
 # FIX: _compute_expiry — kiểm tra hours TRƯỚC days
 # =========================================================
 
+def get_vietnam_time() -> datetime:
+    # Trả về datetime đại diện cho giờ Việt Nam (UTC+7)
+    return datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=7)
+
 def _now_iso() -> str:
-    return datetime.now().isoformat()
+    return get_vietnam_time().isoformat()
 
 
 def _parse_iso(dt_str: str):
@@ -372,6 +376,50 @@ def health():
 @app.route("/api/session")
 def session_info():
     return jsonify({"logged_in": bool(session.get("logged_in"))})
+
+
+@app.route("/api/shorten")
+def shorten_link():
+    target_url = request.args.get("url")
+    token_user = os.getenv("LAYMA_API_KEY") or "52f90acd7ef7e89e8c594189579ccb2b"
+    if not target_url:
+        return "Missing url parameter", 400
+        
+    import urllib.request
+    import urllib.parse
+    
+    encoded_target_url = urllib.parse.quote(target_url)
+    api_url = f"https://api.layma.net/api/admin/shortlink/quicklink?tokenUser={token_user}&format=json&url={encoded_target_url}"
+    
+    try:
+        req = urllib.request.Request(
+            api_url, 
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            res_body = response.read().decode('utf-8')
+            data = json.loads(res_body)
+            if data.get("success") and "html" in data:
+                return redirect(data["html"])
+    except Exception as e:
+        print("Error format=json:", e)
+        
+    # Fallback to format=text
+    try:
+        api_url_text = f"https://api.layma.net/api/admin/shortlink/quicklink?tokenUser={token_user}&format=text&url={encoded_target_url}"
+        req_text = urllib.request.Request(
+            api_url_text, 
+            headers={'User-Agent': 'Mozilla/5.0'}
+        )
+        with urllib.request.urlopen(req_text, timeout=10) as response_text:
+            text_url = response_text.read().decode('utf-8').strip()
+            if text_url.startswith("http"):
+                return redirect(text_url)
+    except Exception as e:
+        print("Error format=text:", e)
+        
+    # Nếu lỗi toàn bộ, redirect trực tiếp về target_url (bypass)
+    return redirect(target_url)
 
 
 # =========================================================
@@ -602,7 +650,7 @@ def key_info(key_string: str):
         return jsonify({"error": "Key không tồn tại"}), 404
 
     d = doc.to_dict()
-    now = datetime.now()
+    now = get_vietnam_time()
     status_text, expires_display = _build_status(d, now)
 
     return jsonify({
@@ -654,7 +702,7 @@ def key_stats(key_string: str):
         print("WARN keystats logs:", e)
 
     last_used = logs[0].get("ts") if logs else None
-    now = datetime.now()
+    now = get_vietnam_time()
     active_devices = sum(
         1
         for dev in devices.values()
@@ -692,7 +740,7 @@ def get_all_keys():
         except Exception:
             docs = list(keys_ref.stream())
 
-        now = datetime.now()
+        now = get_vietnam_time()
         rows = []
         for key_doc in docs:
             kd = key_doc.to_dict()
@@ -770,7 +818,7 @@ def redeem_key():
     if key_data.get("is_banned"):
         return jsonify({"status": "error", "message": "Key đã bị cấm"}), 403
 
-    now = datetime.now()
+    now = get_vietnam_time()
     first_activated_at = key_data.get("first_activated_at")
     key_type           = key_data.get("key_type", "single_device")
 
