@@ -24,8 +24,7 @@ load_dotenv()
 # App & Security Config
 # =========================================================
 
-# Khởi tạo Flask hỗ trợ serve thư mục tĩnh 'public' chứa index.html và success.html
-app = Flask(__name__, static_folder='public', static_url_path='')
+app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY") or "fallback_secret_key_DO_NOT_USE_IN_PRODUCTION"
 app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=int(os.getenv("SESSION_MINUTES", "30")))
 app.config["SESSION_COOKIE_SAMESITE"] = "None"
@@ -228,7 +227,7 @@ def _duration_label(key_data: dict) -> str:
 
 
 # =========================================================
-# FIX: Timezone Việt Nam Đồng Nhất & Cực Kỳ Chính Xác
+# FIX: Múi giờ Việt Nam Đồng Nhất & Cực Kỳ Chính Xác
 # =========================================================
 
 VIETNAM_TZ = timezone(timedelta(hours=7))
@@ -243,8 +242,9 @@ def _now_iso() -> str:
 
 def _parse_iso(dt_val):
     """
-    Chuyển đổi chuỗi ISO, đối tượng datetime, hoặc Firestore Timestamp
-    về datetime naive đại diện cho giờ Việt Nam (UTC+7).
+    Hàm parse thời gian cực kỳ mạnh mẽ để tránh lệch múi giờ:
+    Chuyển đổi chuỗi ISO (naive hoặc aware), đối tượng datetime, hoặc Firestore Timestamp
+    về datetime naive đại diện cho giờ Việt Nam (UTC+7) để so sánh đồng nhất.
     """
     if dt_val is None:
         return None
@@ -261,6 +261,7 @@ def _parse_iso(dt_val):
         except Exception:
             return None
     else:
+        # Hỗ trợ đối tượng Timestamp của Firebase
         try:
             dt = dt_val.to_datetime()
         except Exception:
@@ -269,6 +270,7 @@ def _parse_iso(dt_val):
     if dt is None:
         return None
 
+    # Nếu có timezone info, chuyển sang múi giờ VN rồi chuyển về naive
     if dt.tzinfo is not None:
         return dt.astimezone(VIETNAM_TZ).replace(tzinfo=None)
     
@@ -278,11 +280,14 @@ def _parse_iso(dt_val):
 def _compute_expiry(first_activated_at: str, key_data: dict):
     """
     Tính thời điểm hết hạn dựa trên first_activated_at + duration.
+    ✅ Ưu tiên duration_hours trước duration_days.
+    Trả về datetime hoặc None nếu dữ liệu không hợp lệ.
     """
     dt = _parse_iso(first_activated_at)
     if dt is None:
         return None
 
+    # ✅ Kiểm tra hours trước
     hours = key_data.get("duration_hours")
     if hours is not None:
         try:
@@ -292,6 +297,7 @@ def _compute_expiry(first_activated_at: str, key_data: dict):
         if hours > 0:
             return dt + timedelta(hours=hours)
 
+    # Sau đó mới kiểm tra days
     days = key_data.get("duration_days", 0)
     try:
         days = int(days)
@@ -381,140 +387,6 @@ def update_usage_tracking(
 
 
 # =========================================================
-# Lấy địa chỉ IP chính xác (CF-Connecting-IP hoặc X-Forwarded-For)
-# =========================================================
-
-def get_client_ip(req) -> str:
-    cf_ip = req.headers.get("CF-Connecting-IP")
-    forwarded_ip = req.headers.get("X-Forwarded-For")
-    if cf_ip:
-        return cf_ip
-    if forwarded_ip:
-        return forwarded_ip.split(',')[0].strip()
-    return req.remote_addr or "0.0.0.0"
-
-
-# =========================================================
-# Funlink API Helper
-# =========================================================
-
-def get_funlink_short_url(target_url: str) -> str:
-    import urllib.request
-    import urllib.parse
-    
-    apikey = '65d4f6c0bb16481fbe5f6b69f9922bcb'
-    encoded_url = urllib.parse.quote(target_url)
-    api_url = f"https://private.funlink.io/api/cong-khai/tao-lien-ket?apikey={apikey}&url={encoded_url}"
-    
-    try:
-        req = urllib.request.Request(api_url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=10) as response:
-            res_body = response.read().decode('utf-8')
-            data = json.loads(res_body)
-            if data.get("id"):
-                return f"https://private.funlink.io/{data['id']}"
-    except Exception as e:
-        print("🔥 Lỗi Funlink API:", e)
-    return None
-
-
-# =========================================================
-# Routes — Unlock Download & Callback
-# =========================================================
-
-@app.route("/unlock")
-def unlock_redirect():
-    return redirect("/index.html")
-
-
-@app.route("/api/create-session")
-def api_create_session():
-    if not _check_db():
-        return jsonify({"success": false, "message": "Lỗi kết nối database"}), 500
-
-    ip = get_client_ip(request)
-    session_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=32))
-    now = get_vietnam_time()
-
-    session_data = {
-        "id": session_id,
-        "ip": ip,
-        "hwid": None,
-        "status": "pending",
-        "created_at": now.isoformat(),
-        "updated_at": now.isoformat()
-    }
-
-    try:
-        db.collection("bypass_sessions").document(session_id).set(session_data)
-        
-        proto = "https" if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https" else "http"
-        host = request.headers.get("Host")
-        target_callback_url = f"{proto}://{host}/callback?session={session_id}"
-        
-        print(f"Đang yêu cầu rút gọn link cho callback: {target_callback_url}")
-        
-        if "localhost" in host or "127.0.0.1" in host:
-            return jsonify({
-                "success": True,
-                "sessionId": session_id,
-                "shortLink": target_callback_url,
-                "isLocal": True
-            })
-            
-        short_link = get_funlink_short_url(target_callback_url)
-        if short_link:
-            return jsonify({"success": True, "sessionId": session_id, "shortLink": short_link})
-        else:
-            return jsonify({
-                "success": True, 
-                "sessionId": session_id, 
-                "shortLink": target_callback_url,
-                "warning": "Lỗi Funlink API, đang chạy ở chế độ dự phòng trực tiếp."
-            })
-    except Exception as e:
-        print("Lỗi tạo session:", e)
-        return jsonify({"success": False, "message": "Lỗi lưu dữ liệu session."}), 500
-
-
-@app.route("/callback")
-def handle_callback():
-    if not _check_db():
-        return "Lỗi kết nối cơ sở dữ liệu Firebase", 500
-
-    session_id = request.args.get("session")
-    current_ip = get_client_ip(request)
-
-    if not session_id:
-        return "Thiếu thông tin session.", 400
-
-    try:
-        doc_ref = db.collection("bypass_sessions").document(session_id)
-        doc = doc_ref.get()
-
-        if not doc.exists:
-            return "Phiên giao dịch không tồn tại hoặc đã hết hạn.", 400
-
-        s_data = doc.to_dict()
-        if s_data.get("status") != "pending":
-            return "Phiên giao dịch này đã được kích hoạt hoặc không còn hợp lệ.", 400
-
-        if s_data.get("ip") != current_ip:
-            return "Bypass thất bại! IP của bạn không khớp với IP ban đầu yêu cầu vượt link.", 403
-
-        now = get_vietnam_time()
-        doc_ref.update({
-            "status": "completed",
-            "updated_at": now.isoformat()
-        })
-        
-        return redirect(f"/success.html?session={session_id}")
-    except Exception as e:
-        print("Lỗi callback:", e)
-        return "Lỗi hệ thống trong quá trình xử lý.", 500
-
-
-# =========================================================
 # Routes — Public
 # =========================================================
 
@@ -564,6 +436,7 @@ def shorten_link():
     except Exception as e:
         print("Error format=json:", e)
         
+    # Fallback to format=text
     try:
         api_url_text = f"https://api.layma.net/api/admin/shortlink/quicklink?tokenUser={token_user}&format=text&url={encoded_target_url}"
         req_text = urllib.request.Request(
@@ -631,6 +504,7 @@ def create_key():
     if key_type not in ("single_device", "multi_device"):
         return jsonify({"error": "key_type không hợp lệ"}), 400
 
+    # Retry on unlikely collision
     for _ in range(5):
         key_string = generate_key_string()
         key_doc_ref = get_key_doc(key_string)
@@ -643,7 +517,7 @@ def create_key():
         "key_string": key_string,
         "key_type": key_type,
         "duration_days": duration_days or 0,
-        "duration_hours": duration_hours,
+        "duration_hours": duration_hours,   # None nếu dùng days
         "expires_at": None,
         "created_at": _now_iso(),
         "created_by": (data.get("created_by") or "AdminPanel").strip()[:64],
@@ -677,6 +551,7 @@ def create_key():
 @login_required
 @require_json
 def create_key_3h():
+    """Shortcut: tạo key 3 giờ single_device."""
     if not _check_db():
         return jsonify({"error": "Lỗi kết nối cơ sở dữ liệu"}), 500
 
@@ -943,7 +818,7 @@ def redeem_key():
     key_string   = (data.get("key") or "").strip()
     hwid         = (data.get("hwid") or "").strip()
     machine_name = (data.get("machine_name") or "UnknownMachine").strip()
-    ip_address   = get_client_ip(request)
+    ip_address   = request.headers.get("CF-Connecting-IP") or request.remote_addr
 
     extra_info = {
         "windows_version": data.get("windows_version", "N/A"),
@@ -954,56 +829,12 @@ def redeem_key():
         "client_version":  data.get("client_version", "N/A"),
     }
 
+    # ── Validate input ──────────────────────────────────────────────
     if not key_string or not hwid:
         return jsonify({"status": "error", "message": "Thiếu key hoặc HWID"}), 400
 
     if not is_valid_key_format(key_string):
         return jsonify({"status": "error", "message": "Định dạng key không hợp lệ"}), 400
-
-    # ── 1. CHECK BYPASS UNLOCK DOWNLOAD ──────────────────────────────────────
-    bypass_verified = False
-    try:
-        one_day_ago = (get_vietnam_time() - timedelta(hours=24)).isoformat()
-        
-        sessions_ref = db.collection("bypass_sessions")
-        query = (
-            sessions_ref
-            .where("ip", "==", ip_address)
-            .where("status", "==", "completed")
-            .where("updated_at", ">=", one_day_ago)
-            .stream()
-        )
-        
-        valid_sessions = []
-        for s in query:
-            s_data = s.to_dict()
-            s_data["id"] = s.id
-            valid_sessions.append(s_data)
-            
-        if valid_sessions:
-            valid_sessions.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-            latest_session = valid_sessions[0]
-            bypass_doc_id = latest_session["id"]
-            
-            stored_bypass_hwid = latest_session.get("hwid")
-            if not stored_bypass_hwid:
-                sessions_ref.document(bypass_doc_id).update({"hwid": hwid})
-                bypass_verified = True
-            elif stored_bypass_hwid == hwid:
-                bypass_verified = True
-            else:
-                return jsonify({
-                    "status": "error", 
-                    "message": "Thiết bị không trùng khớp với máy đã vượt link đăng ký hôm nay!"
-                }), 403
-    except Exception as e:
-        print("🔥 Lỗi kiểm tra bypass:", e)
-        
-    if not bypass_verified:
-        return jsonify({
-            "status": "error", 
-            "message": "IP hoặc HWID của bạn chưa vượt link unlock ngày hôm nay! Vui lòng vượt link rút gọn để mở khóa."
-        }), 403
 
     # ── Fetch key document ──────────────────────────────────────────
     key_doc_ref = get_key_doc(key_string)
@@ -1014,6 +845,7 @@ def redeem_key():
 
     key_data = key_doc.to_dict()
 
+    # ── Banned check ────────────────────────────────────────────────
     if key_data.get("is_banned"):
         return jsonify({"status": "error", "message": "Key đã bị cấm"}), 403
 
@@ -1023,6 +855,7 @@ def redeem_key():
 
     # ── FIRST ACTIVATION ────────────────────────────────────────────
     if not first_activated_at:
+        # ✅ _compute_expiry đã xử lý đúng hours và days
         exp_dt = _compute_expiry(now.isoformat(), key_data)
 
         if exp_dt is None:
@@ -1043,6 +876,7 @@ def redeem_key():
 
         update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
 
+        # Tính số giây còn lại cho game client
         remaining_seconds = int((exp_dt - now).total_seconds())
         if remaining_seconds < 0: remaining_seconds = 0
 
@@ -1052,10 +886,11 @@ def redeem_key():
             "expires_at": expires_at,
             "expires_display": exp_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "duration_label": _duration_label(key_data),
-            "expiry_left": str(remaining_seconds)
+            "expiry_left": str(remaining_seconds) # Trả về số giây còn lại cho game client
         }), 200
 
     # ── EXPIRY CHECK ─────────────────────────────────────────────────
+    # ✅ _compute_expiry trả đúng datetime cho cả hours lẫn days
     exp = _compute_expiry(first_activated_at, key_data)
 
     if exp is None:
@@ -1086,6 +921,7 @@ def redeem_key():
     # ── SUCCESS ──────────────────────────────────────────────────────
     update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
 
+    # Tính số giây còn lại
     remaining_seconds = int((exp - now).total_seconds())
     if remaining_seconds < 0: remaining_seconds = 0
 
@@ -1097,7 +933,7 @@ def redeem_key():
         "registered_hwid": stored_hwid,
         "current_server_time": now.isoformat(),
         "duration_label": _duration_label(key_data),
-        "expiry_left": str(remaining_seconds)
+        "expiry_left": str(remaining_seconds) # Trả về số giây còn lại cho game client
     }), 200
 
 
