@@ -349,10 +349,35 @@ def update_usage_tracking(
     machine_name: str,
     ip_address: str,
     extra_info: dict = None,
+    force_write: bool = False,
 ):
     extra_info = extra_info or {}
     machine_name = machine_name or "UnknownMachine"
     now_iso = _now_iso()
+    now_dt = get_vietnam_time()
+
+    devices = key_data.get("devices") or {}
+    dev = devices.get(hwid)
+
+    # Throttling logic to prevent Firestore quota exhaustion:
+    # Only write to database if force_write is True (first activation or violation),
+    # or if this device is new, or if its last_seen timestamp was more than 30 minutes ago.
+    should_write = force_write or (not dev)
+    if dev and not should_write:
+        last_seen_str = dev.get("last_seen")
+        if last_seen_str:
+            last_seen_dt = _parse_iso(last_seen_str)
+            if last_seen_dt:
+                time_diff = now_dt - last_seen_dt
+                if time_diff.total_seconds() > 1800:  # 30 minutes
+                    should_write = True
+            else:
+                should_write = True
+        else:
+            should_write = True
+
+    if not should_write:
+        return
 
     log_entry = {
         "ts": now_iso,
@@ -368,8 +393,6 @@ def update_usage_tracking(
     except Exception as e:
         print("WARN access_logs:", e)
 
-    devices: dict = key_data.get("devices") or {}
-    dev = devices.get(hwid)
     new_entry = {
         "hwid": hwid,
         "machine_name": machine_name,
@@ -874,7 +897,7 @@ def redeem_key():
         key_doc_ref.update(updates)
         key_data.update(updates)
 
-        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info, force_write=True)
 
         # Tính số giây còn lại cho game client
         remaining_seconds = int((exp_dt - now).total_seconds())
@@ -910,7 +933,7 @@ def redeem_key():
             key_doc_ref.update({"violations": firestore.Increment(1)})
         except Exception:
             pass
-        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+        update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info, force_write=True)
         return jsonify({
             "status": "error",
             "message": "Key này đã được kích hoạt trên thiết bị khác",
@@ -919,7 +942,7 @@ def redeem_key():
         }), 403
 
     # ── SUCCESS ──────────────────────────────────────────────────────
-    update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info)
+    update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info, force_write=False)
 
     # Tính số giây còn lại
     remaining_seconds = int((exp - now).total_seconds())
