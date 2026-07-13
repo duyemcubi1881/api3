@@ -5,6 +5,7 @@ import random
 import string
 import json
 import time
+import threading  # Thêm thư viện Lock cho cache thread-safe
 
 from datetime import datetime, timedelta, timezone
 from functools import wraps
@@ -120,6 +121,64 @@ def is_valid_key_format(key_string: str) -> bool:
     if len(suffix) < 3 or len(suffix) > 32:
         return False
     return suffix.isalnum()
+
+
+# =========================================================
+# In-Memory Cache (Bộ nhớ đệm tránh spam Firestore)
+# =========================================================
+_cache_lock = threading.Lock()
+KEY_CACHE = {}     # Cấu trúc: key_string -> {"timestamp": float, "data": dict, "exists": bool}
+CACHE_TTL = 300    # Đợi 5 phút (300 giây) trước khi đọc lại Firestore cho cùng 1 key
+
+
+def get_cached_key_doc(key_string: str) -> tuple:
+    """
+    Trả về (exists, key_data). Lấy từ bộ nhớ đệm nếu còn hạn để giảm tải Firestore.
+    """
+    now = time.time()
+    with _cache_lock:
+        cached = KEY_CACHE.get(key_string)
+        if cached and (now - cached["timestamp"] < CACHE_TTL):
+            return cached["exists"], cached["data"]
+
+    # Cache miss -> Đọc trực tiếp từ database
+    try:
+        key_doc_ref = get_key_doc(key_string)
+        doc = key_doc_ref.get()
+        exists = doc.exists
+        data = doc.to_dict() if exists else None
+    except Exception as e:
+        print(f"Error fetching from Firestore for cache: {e}")
+        # Nếu DB lỗi tạm thời mà cache vẫn có dữ liệu cũ, trả về dữ liệu cũ để tránh sập hệ thống
+        if cached:
+            return cached["exists"], cached["data"]
+        raise e
+
+    # Lưu lại vào cache
+    with _cache_lock:
+        KEY_CACHE[key_string] = {
+            "timestamp": now,
+            "data": data,
+            "exists": exists
+        }
+    return exists, data
+
+
+def invalidate_key_cache(key_string: str):
+    """Xóa cache của một key khi có cập nhật."""
+    with _cache_lock:
+        KEY_CACHE.pop(key_string, None)
+
+
+def update_key_cache(key_string: str, exists: bool, data: dict):
+    """Cập nhật dữ liệu mới trực tiếp vào cache để lần đọc sau có ngay thông tin mới."""
+    now = time.time()
+    with _cache_lock:
+        KEY_CACHE[key_string] = {
+            "timestamp": now,
+            "data": data,
+            "exists": exists
+        }
 
 
 # =========================================================
@@ -242,9 +301,7 @@ def _now_iso() -> str:
 
 def _parse_iso(dt_val):
     """
-    Hàm parse thời gian cực kỳ mạnh mẽ để tránh lệch múi giờ:
-    Chuyển đổi chuỗi ISO (naive hoặc aware), đối tượng datetime, hoặc Firestore Timestamp
-    về datetime naive đại diện cho giờ Việt Nam (UTC+7) để so sánh đồng nhất.
+    Hàm parse thời gian cực kỳ mạnh mẽ để tránh lệch múi giờ.
     """
     if dt_val is None:
         return None
@@ -261,7 +318,6 @@ def _parse_iso(dt_val):
         except Exception:
             return None
     else:
-        # Hỗ trợ đối tượng Timestamp của Firebase
         try:
             dt = dt_val.to_datetime()
         except Exception:
@@ -270,7 +326,6 @@ def _parse_iso(dt_val):
     if dt is None:
         return None
 
-    # Nếu có timezone info, chuyển sang múi giờ VN rồi chuyển về naive
     if dt.tzinfo is not None:
         return dt.astimezone(VIETNAM_TZ).replace(tzinfo=None)
     
@@ -280,14 +335,11 @@ def _parse_iso(dt_val):
 def _compute_expiry(first_activated_at: str, key_data: dict):
     """
     Tính thời điểm hết hạn dựa trên first_activated_at + duration.
-    ✅ Ưu tiên duration_hours trước duration_days.
-    Trả về datetime hoặc None nếu dữ liệu không hợp lệ.
     """
     dt = _parse_iso(first_activated_at)
     if dt is None:
         return None
 
-    # ✅ Kiểm tra hours trước
     hours = key_data.get("duration_hours")
     if hours is not None:
         try:
@@ -297,7 +349,6 @@ def _compute_expiry(first_activated_at: str, key_data: dict):
         if hours > 0:
             return dt + timedelta(hours=hours)
 
-    # Sau đó mới kiểm tra days
     days = key_data.get("duration_days", 0)
     try:
         days = int(days)
@@ -359,9 +410,10 @@ def update_usage_tracking(
     devices = key_data.get("devices") or {}
     dev = devices.get(hwid)
 
-    # Throttling logic to prevent Firestore quota exhaustion:
-    # Only write to database if force_write is True (first activation or violation),
-    # or if this device is new, or if its last_seen timestamp was more than 30 minutes ago.
+    # Chỉ ghi đè lên database khi:
+    # 1. force_write = True (kích hoạt lần đầu hoặc phát hiện thiết bị vi phạm)
+    # 2. Hoặc thiết bị này mới hoàn toàn
+    # 3. Hoặc thời gian hoạt động cuối cùng của thiết bị này cách đây hơn 30 phút
     should_write = force_write or (not dev)
     if dev and not should_write:
         last_seen_str = dev.get("last_seen")
@@ -405,6 +457,8 @@ def update_usage_tracking(
 
     try:
         key_doc_ref.update({f"devices.{hwid}": new_entry})
+        # Khi update thông tin thiết bị thành công, invalidate cache để thông tin đồng bộ
+        invalidate_key_cache(key_doc_ref.id)
     except Exception as e:
         print("WARN update devices:", e)
 
@@ -527,10 +581,10 @@ def create_key():
     if key_type not in ("single_device", "multi_device"):
         return jsonify({"error": "key_type không hợp lệ"}), 400
 
-    # Retry on unlikely collision
     for _ in range(5):
         key_string = generate_key_string()
         key_doc_ref = get_key_doc(key_string)
+        # Bypassing cache checking here for security, directly checking DB existence
         if not key_doc_ref.get().exists:
             break
     else:
@@ -540,7 +594,7 @@ def create_key():
         "key_string": key_string,
         "key_type": key_type,
         "duration_days": duration_days or 0,
-        "duration_hours": duration_hours,   # None nếu dùng days
+        "duration_hours": duration_hours,
         "expires_at": None,
         "created_at": _now_iso(),
         "created_by": (data.get("created_by") or "AdminPanel").strip()[:64],
@@ -555,6 +609,9 @@ def create_key():
 
     try:
         key_doc_ref.set(key_data)
+        # Nạp thẳng thông tin key vừa tạo vào cache
+        update_key_cache(key_string, True, key_data)
+        
         resp = {
             "message": "Tạo key thành công!",
             "key": key_string,
@@ -610,6 +667,9 @@ def create_key_3h():
 
     try:
         key_doc_ref.set(key_data)
+        # Nạp thẳng thông tin key vừa tạo vào cache
+        update_key_cache(key_string, True, key_data)
+        
         return jsonify({
             "message": "Tạo key 3 giờ thành công!",
             "key": key_string,
@@ -645,6 +705,8 @@ def delete_key():
         print("WARN delete access_logs:", e)
 
     ref.delete()
+    # Invalidate cache khi xóa key
+    invalidate_key_cache(key_string)
     return jsonify({"message": f"Đã xoá {key_string}"}), 200
 
 
@@ -665,6 +727,8 @@ def ban_key():
         return jsonify({"error": "Key không tồn tại"}), 404
 
     ref.update({"is_banned": True})
+    # Invalidate cache khi ban key
+    invalidate_key_cache(key_string)
     return jsonify({"message": f"Đã ban {key_string}"}), 200
 
 
@@ -685,6 +749,8 @@ def unban_key():
         return jsonify({"error": "Key không tồn tại"}), 404
 
     ref.update({"is_banned": False})
+    # Invalidate cache khi unban key
+    invalidate_key_cache(key_string)
     return jsonify({"message": f"Đã unban {key_string}"}), 200
 
 
@@ -704,6 +770,9 @@ def key_info(key_string: str):
         return jsonify({"error": "Key không tồn tại"}), 404
 
     d = doc.to_dict()
+    # Cập nhật cache với dữ liệu thực tế vừa đọc
+    update_key_cache(key_string, True, d)
+
     now = get_vietnam_time()
     status_text, expires_display = _build_status(d, now)
 
@@ -739,6 +808,9 @@ def key_stats(key_string: str):
         return jsonify({"error": "Key không tồn tại"}), 404
 
     d = doc.to_dict()
+    # Đồng bộ cache
+    update_key_cache(key_string, True, d)
+    
     devices: dict = d.get("devices") or {}
     total_devices = len(devices)
     limit = min(int(request.args.get("limit", 30)), 100)
@@ -785,14 +857,33 @@ def get_all_keys():
     try:
         page = max(1, int(request.args.get("page", "1")))
         page_size = min(max(1, int(request.args.get("page_size", "100"))), 500)
+        start = (page - 1) * page_size
 
         keys_ref = db.collection("keys")
+        
+        # TỐI ƯU 1: Đếm tổng số lượng key dùng truy vấn Aggregation Count của Firestore (cực rẻ, tránh tốn phí load dữ liệu)
         try:
-            docs = list(
-                keys_ref.order_by("created_at", direction=firestore.Query.DESCENDING).stream()
-            )
-        except Exception:
-            docs = list(keys_ref.stream())
+            total = keys_ref.count().get()[0].value
+        except Exception as e:
+            print("Failed to get count via count():", e)
+            try:
+                # Fallback: Chỉ select các trường ID trống (rất nhanh và rẻ)
+                total = len(list(keys_ref.select([]).stream()))
+            except Exception:
+                total = 0
+
+        # TỐI ƯU 2: Phân trang thực tế ngay trên Firestore, chỉ stream đúng số tài liệu cần hiển thị
+        try:
+            query = keys_ref.order_by("created_at", direction=firestore.Query.DESCENDING)
+            docs = list(query.offset(start).limit(page_size).stream())
+        except Exception as e:
+            print("Failed to paginate with offset/limit:", e)
+            # Tránh crash: fallback load bình thường nếu SDK không hỗ trợ offset/limit
+            try:
+                all_docs = list(keys_ref.order_by("created_at", direction=firestore.Query.DESCENDING).stream())
+            except Exception:
+                all_docs = list(keys_ref.stream())
+            docs = all_docs[start : start + page_size]
 
         now = get_vietnam_time()
         rows = []
@@ -817,10 +908,7 @@ def get_all_keys():
                 "note": kd.get("note", ""),
             })
 
-        total = len(rows)
-        start = (page - 1) * page_size
-        items = rows[start: start + page_size]
-        return jsonify({"items": items, "total": total, "page": page, "page_size": page_size})
+        return jsonify({"items": rows, "total": total, "page": page, "page_size": page_size})
 
     except Exception as e:
         return jsonify({"error": f"Lỗi khi tải keys: {str(e)}"}), 500
@@ -859,14 +947,11 @@ def redeem_key():
     if not is_valid_key_format(key_string):
         return jsonify({"status": "error", "message": "Định dạng key không hợp lệ"}), 400
 
-    # ── Fetch key document ──────────────────────────────────────────
-    key_doc_ref = get_key_doc(key_string)
-    key_doc     = key_doc_ref.get()
+    # ── Fetch key document (Đã tối ưu hóa qua RAM Cache) ────────────
+    exists, key_data = get_cached_key_doc(key_string)
 
-    if not key_doc.exists:
+    if not exists:
         return jsonify({"status": "error", "message": "Key không tồn tại"}), 404
-
-    key_data = key_doc.to_dict()
 
     # ── Banned check ────────────────────────────────────────────────
     if key_data.get("is_banned"):
@@ -875,10 +960,10 @@ def redeem_key():
     now = get_vietnam_time()
     first_activated_at = key_data.get("first_activated_at")
     key_type           = key_data.get("key_type", "single_device")
+    key_doc_ref        = get_key_doc(key_string)
 
     # ── FIRST ACTIVATION ────────────────────────────────────────────
     if not first_activated_at:
-        # ✅ _compute_expiry đã xử lý đúng hours và days
         exp_dt = _compute_expiry(now.isoformat(), key_data)
 
         if exp_dt is None:
@@ -894,8 +979,14 @@ def redeem_key():
             "hwid": hwid,
             "ip_address": ip_address,
         }
-        key_doc_ref.update(updates)
-        key_data.update(updates)
+        
+        try:
+            key_doc_ref.update(updates)
+            # Invalidate cache của key này ngay lập tức để đồng bộ lại thông tin mới kích hoạt
+            invalidate_key_cache(key_string)
+            key_data.update(updates)
+        except Exception as e:
+            return jsonify({"status": "error", "message": f"Lỗi kích hoạt key: {e}"}), 500
 
         update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info, force_write=True)
 
@@ -909,11 +1000,10 @@ def redeem_key():
             "expires_at": expires_at,
             "expires_display": exp_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "duration_label": _duration_label(key_data),
-            "expiry_left": str(remaining_seconds) # Trả về số giây còn lại cho game client
+            "expiry_left": str(remaining_seconds)  # Trả về số giây còn lại cho game client
         }), 200
 
     # ── EXPIRY CHECK ─────────────────────────────────────────────────
-    # ✅ _compute_expiry trả đúng datetime cho cả hours lẫn days
     exp = _compute_expiry(first_activated_at, key_data)
 
     if exp is None:
@@ -931,6 +1021,7 @@ def redeem_key():
     if key_type == "single_device" and stored_hwid and stored_hwid != hwid:
         try:
             key_doc_ref.update({"violations": firestore.Increment(1)})
+            invalidate_key_cache(key_string)
         except Exception:
             pass
         update_usage_tracking(key_doc_ref, key_data, hwid, machine_name, ip_address, extra_info, force_write=True)
@@ -956,7 +1047,7 @@ def redeem_key():
         "registered_hwid": stored_hwid,
         "current_server_time": now.isoformat(),
         "duration_label": _duration_label(key_data),
-        "expiry_left": str(remaining_seconds) # Trả về số giây còn lại cho game client
+        "expiry_left": str(remaining_seconds)  # Trả về số giây còn lại cho game client
     }), 200
 
 
